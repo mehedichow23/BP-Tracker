@@ -121,6 +121,29 @@ create policy profiles_update_own
   using (id = auth.uid())
   with check (id = auth.uid());
 
+-- profiles_update_own only restricts *which row* can be touched (id =
+-- auth.uid()), not which columns change. Without this trigger, an
+-- authenticated user could call `update profiles set household_id = ...`
+-- directly and reassign their own household, since household_id is the
+-- source of truth every other RLS policy trusts. Blocked for regular users;
+-- auth.uid() is null for service-role calls, so scripts/create-users.mjs can
+-- still set household_id during provisioning.
+create or replace function public.prevent_household_id_change()
+returns trigger
+language plpgsql
+as $$
+begin
+  if auth.uid() is not null and new.household_id is distinct from old.household_id then
+    raise exception 'household_id cannot be changed directly';
+  end if;
+  return new;
+end;
+$$;
+
+create trigger profiles_prevent_household_change
+  before update on public.profiles
+  for each row execute function public.prevent_household_id_change();
+
 -- No insert/delete policies: profiles are created only by the
 -- handle_new_user trigger and never removed by the client.
 
@@ -151,9 +174,17 @@ create policy readings_delete_own
 -- Convention: object path is "<user_id>/<filename>" so ownership and
 -- household membership can be derived from the path prefix.
 -- ============================================================
-insert into storage.buckets (id, name, public)
-values ('bp-images', 'bp-images', false)
-on conflict (id) do nothing;
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'bp-images',
+  'bp-images',
+  false,
+  15728640, -- 15 MB
+  array['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']
+)
+on conflict (id) do update set
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
 
 create policy bp_images_select_household
   on storage.objects for select
